@@ -27,17 +27,67 @@ func (stats TemperatureStats) String() string {
 	return fmt.Sprintf("Min: %.2f, Max: %.2f, Avg: %.2f", stats.min, stats.max, stats.avg)
 }
 
-func temperatureStatsWorker(id int, lines <-chan string, results chan<- map[string]TemperatureStats, wg *sync.WaitGroup) {
+func processLines(id int, start, end int64, filePath string, wg *sync.WaitGroup, results chan<- map[string]TemperatureStats) {
 	defer wg.Done()
+
+	file, err := os.Open(filePath)
+	if err != nil {
+		fmt.Println("Error: ", err)
+		return
+	}
+	defer file.Close()
 
 	stats := make(map[string]TemperatureStats)
 
-	for line := range lines {
+	// Seek to the start position
+	_, err2 := file.Seek(start, 0)
+	if err2 != nil {
+		fmt.Printf("Worker %d - Error seeking file: %s\n", id, err)
+		return
+	}
+
+	isFirstChunk := start == 0
+	/*
+		We can't find the perfect chunk size because we don't know the exact position of the line breaks.
+		For this reason we'll have to adjust the start and end accordingly.
+	*/
+
+	// For chunks that are not the first, skip until the end of the first line break
+	if !isFirstChunk {
+		// Read bytes until you find a newline character, indicating the start of a new line
+		b := make([]byte, 1)
+		for {
+			_, err := file.Read(b)
+			if err != nil {
+				fmt.Printf("Worker %d - Error reading file: %s\n", id, err)
+				return
+			}
+
+			// fmt.Printf("Line Worker %d - read byte file: %c\n", id, b[0])
+			// Increment start position to not re-process the same byte
+			start += 1
+			if b[0] == '\n' || start >= end {
+				break
+			}
+		}
+	}
+
+	scanner := bufio.NewScanner(file)
+	currentPosition := start
+
+	// Process lines until the end of this chunk
+	for scanner.Scan() {
+		currentPosition += int64(len(scanner.Bytes())) + 1 // +1 for newline character
+		if currentPosition > end {
+			break
+		}
+		// Process the line
+		line := scanner.Text()
 		parts := strings.Split(line, ";")
 		city := parts[0]
 		temperature, err := strconv.ParseFloat(parts[1], 64)
 		if err != nil {
-			fmt.Println("Error: ", err)
+			fmt.Printf("Worker %d - Error parsing flat: %s\n", id, err)
 			return
 		}
 
@@ -55,8 +105,10 @@ func temperatureStatsWorker(id int, lines <-chan string, results chan<- map[stri
 
 			stats[city] = recording
 		}
+	}
 
-		//fmt.Printf("Worker %d finished task\n", id)
+	if err := scanner.Err(); err != nil {
+		fmt.Printf("Worker %d - Error reading chunk: %s\n", id, err)
 	}
 
 	results <- stats
@@ -111,33 +163,43 @@ func main() {
 }
 
 func calculate() {
-	file, err := os.Open("../../../../measurements.txt")
+	filePath := "../../../../measurements.txt"
+	file, err := os.Open(filePath)
 	if err != nil {
 		fmt.Println("Error: ", err)
 		return
 	}
 	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
+	fileInfo, err := file.Stat()
+	if err != nil {
+		fmt.Println("Error getting file stats:", err)
+		return
+	}
+
+	fileSize := fileInfo.Size()
+	numWorkers := runtime.NumCPU()
+
+	chunkSize := fileSize / int64(numWorkers)
+	results := make(chan map[string]TemperatureStats, numWorkers+1)
 	stats := make(map[string]TemperatureStats)
 
 	var wg sync.WaitGroup
-	numWorkers := runtime.NumCPU() - 1
-	linesChannel := make(chan string, 1000)
-	results := make(chan map[string]TemperatureStats, numWorkers)
+	workerId := 0
+	for start := int64(0); start < fileSize; start += chunkSize {
+		end := start + chunkSize
+		if end > fileSize {
+			end = fileSize
+		}
 
-	// Create Task Workers to distribute temperature stats calculation tasks
-	log.Printf("Adding %d workers to process temperature stats\n", numWorkers)
-	for i := 0; i < numWorkers; i++ {
+		log.Printf("Adding worker %d to read file from %d up to %d \n", workerId, start, end)
+
 		wg.Add(1)
-		go temperatureStatsWorker(i, linesChannel, results, &wg)
+		go processLines(workerId, start, end, filePath, &wg, results)
+		workerId++
 	}
 
-	for scanner.Scan() {
-		linesChannel <- scanner.Text()
-	}
-
-	close(linesChannel) // No more tasks to be added, close the channel.
+	// No more tasks to be added, close the channel.
 	wg.Wait()
 	close(results)
 
